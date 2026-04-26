@@ -73,7 +73,7 @@ export default function (pi: ExtensionAPI) {
     try {
       currentConfig = loadConfig();
     } catch (err: any) {
-      ctx.ui.notify(`session-search: ${err.message}`, "warning");
+      try { ctx.ui.notify(`session-search: ${err.message}`, "warning"); } catch { /* stale ctx */ }
     }
 
     // FTS5 works out of the box with no config; embeddings are optional.
@@ -81,6 +81,15 @@ export default function (pi: ExtensionAPI) {
   });
 
   async function startIndex(config: Config | null, ctx: any) {
+    // Safe UI helpers: ctx becomes stale after session replacement/reload.
+    // Wrap all UI calls to avoid crashing on stale ctx.
+    const safeSetStatus = (key: string, msg: string | undefined) => {
+      try { ctx.ui.setStatus(key, msg); } catch { /* stale ctx */ }
+    };
+    const safeNotify = (msg: string, level: string) => {
+      try { ctx.ui.notify(msg, level as any); } catch { /* stale ctx */ }
+    };
+
     try {
       if (config?.embedder) {
         const embedder = createEmbedder(config.embedder);
@@ -104,14 +113,14 @@ export default function (pi: ExtensionAPI) {
       const SYNC_TIMEOUT_MS = 600_000;
       Promise.race([
         sessionIndex.sync(
-          (msg) => ctx.ui.setStatus("session-search", msg)
+          (msg: string) => safeSetStatus("session-search", msg)
         ),
         new Promise<null>((resolve) => setTimeout(() => resolve(null), SYNC_TIMEOUT_MS)),
       ])
         .then((syncResult) => {
           if (syncResult === null) {
-            ctx.ui.notify("session-search: sync timed out (index may be stale)", "warning");
-            ctx.ui.setStatus("session-search", "");
+            safeNotify("session-search: sync timed out (index may be stale)", "warning");
+            safeSetStatus("session-search", "");
           } else {
             const { added, updated, removed, moved } = syncResult;
             const changes = added + updated + removed + moved;
@@ -121,17 +130,17 @@ export default function (pi: ExtensionAPI) {
               if (updated) parts.push(`~${updated}`);
               if (removed) parts.push(`-${removed}`);
               if (moved) parts.push(`↗${moved} moved`);
-              ctx.ui.setStatus(
+              safeSetStatus(
                 "session-search",
-                `Sessions: ${parts.join(" ")} (${sessionIndex.size()} total)`
+                `Sessions: ${parts.join(" ")} (${sessionIndex!.size()} total)`
               );
-              setTimeout(() => ctx.ui.setStatus("session-search", ""), 5000);
+              setTimeout(() => safeSetStatus("session-search", ""), 5000);
             }
           }
         })
         .catch((err) => {
-          ctx.ui.notify(`session-search: initial sync failed: ${err.message}`, "warning");
-          ctx.ui.setStatus("session-search", "");
+          safeNotify(`session-search: initial sync failed: ${err.message}`, "warning");
+          safeSetStatus("session-search", "");
         });
 
       // Periodic background sync to pick up new/changed sessions
@@ -146,18 +155,18 @@ export default function (pi: ExtensionAPI) {
             if (result.updated) parts.push(`~${result.updated}`);
             if (result.removed) parts.push(`-${result.removed}`);
             if (result.moved) parts.push(`↗${result.moved} moved`);
-            ctx.ui.setStatus(
+            safeSetStatus(
               "session-search",
-              `Sessions synced: ${parts.join(" ")} (${sessionIndex.size()} total)`
+              `Sessions synced: ${parts.join(" ")} (${sessionIndex!.size()} total)`
             );
-            setTimeout(() => ctx.ui.setStatus("session-search", ""), 5000);
+            setTimeout(() => safeSetStatus("session-search", ""), 5000);
           }
         } catch {
           // Silent — don't spam on background sync failures
         }
       }, SYNC_INTERVAL_MS);
     } catch (err: any) {
-      ctx.ui.notify(`session-search init failed: ${err.message}`, "error");
+      safeNotify(`session-search init failed: ${err.message}`, "error");
     }
   }
 
