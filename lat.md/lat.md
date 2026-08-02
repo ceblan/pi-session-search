@@ -19,6 +19,12 @@ Se divide en: (1) entrypoint de extensión pi, (2) dos índices intercambiables 
 - Lector de conversación: [[src/reader.ts#readSessionConversation]]
 - Utilidades: [[src/utils.ts#buildSummary]] y helpers relacionados
 
+## Documentación interna
+
+Sección transversal que agrupa documentación de las herramientas internas del proyecto (tracker de commits, etc.).
+
+- [[last-commit]] — tracking del último commit revisado por el documentator
+
 ## Directorios y artefactos persistentes
 
 El paquete guarda configuración e índices bajo `~/.pi/session-search/`, tal como define [[src/config.ts#getConfigPath]] y [[src/config.ts#getIndexDir]].
