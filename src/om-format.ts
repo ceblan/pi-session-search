@@ -14,6 +14,7 @@
 import type { OmMemoryHit, OmIndexStats, OmSessionInfo } from "./om";
 import { truncate } from "./utils";
 
+// @lat: [[om#Observational Memory#Tools om_memory_search y om_memory_resolve]]
 export const OM_SEARCH_FOOTER = `----
 Memorias OM indexadas desde los JSONL de sesión (pi-blackhole). Los ids [hex] se resuelven con om_memory_resolve; el contexto conversacional completo con session_read. Si la sesión es la actual, el drill-down entry-level (#N:path) lo da el tool recall de pi-blackhole.
 ----`;

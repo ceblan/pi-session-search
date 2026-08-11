@@ -308,6 +308,7 @@ export function parseSession(
   // OM extraction: separate whole-file pass (never inside the entry switch —
   // the fold needs full-file vision with order). The cheap raw guard means
   // the ~84% of sessions without OM don't pay for the second pass.
+  // @lat: [[om#Observational Memory#Extracción y fold]]
   const omMemories = raw.includes("om.") ? extractOmMemories(entries, header.id) : [];
 
   return {
