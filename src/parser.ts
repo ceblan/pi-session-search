@@ -1,5 +1,7 @@
 import { readFileSync, readdirSync, statSync, existsSync, openSync, readSync, closeSync } from "node:fs";
 import { join, basename, dirname } from "node:path";
+import { extractOmMemories } from "./om";
+import type { OmMemoryRow } from "./om";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -63,6 +65,13 @@ export interface ParsedSession {
   totalCost: number;
   /** Total tokens used */
   totalTokens: number;
+  /**
+   * OM memories (pi-blackhole observational memory) folded from `om.*`
+   * custom entries and `om.folded` compaction snapshots. Empty when the
+   * session has none. Extraction runs as a separate whole-file pass after
+   * the main entry loop, only when the raw file mentions OM at all.
+   */
+  omMemories: OmMemoryRow[];
 }
 
 export interface ToolCallSummary {
@@ -296,6 +305,11 @@ export function parseSession(
     .map(([name, count]) => ({ name, count }))
     .sort((a, b) => b.count - a.count);
 
+  // OM extraction: separate whole-file pass (never inside the entry switch —
+  // the fold needs full-file vision with order). The cheap raw guard means
+  // the ~84% of sessions without OM don't pay for the second pass.
+  const omMemories = raw.includes("om.") ? extractOmMemories(entries, header.id) : [];
+
   return {
     file,
     id: header.id,
@@ -318,6 +332,7 @@ export function parseSession(
     branchSummaries,
     totalCost,
     totalTokens,
+    omMemories,
   };
 }
 

@@ -8,6 +8,14 @@ import { FtsSessionIndex } from "./fts-index";
 import { readSessionConversation } from "./reader";
 import { resolve } from "node:path";
 import { truncate, pathToSlug, formatRelativeDate } from "./utils";
+import { MEMORY_ID_PATTERN, type OmMemoryFilters } from "./om";
+import { omEmbedderFingerprint } from "./om-embeddings";
+import {
+  formatMemorySearchOutput,
+  formatMemoryResolve,
+  formatMemoryNotFound,
+  formatNum,
+} from "./om-format";
 
 type AnyIndex = SessionIndex | FtsSessionIndex;
 
@@ -98,6 +106,7 @@ export default function (pi: ExtensionAPI) {
           getIndexDir(),
           config.extraSessionDirs,
           config.extraArchiveDirs,
+          omEmbedderFingerprint(config.embedder),
         );
       } else {
         sessionIndex = new FtsSessionIndex(
@@ -136,6 +145,22 @@ export default function (pi: ExtensionAPI) {
               );
               setTimeout(() => safeSetStatus("session-search", ""), 5000);
             }
+            // OM embedding reconcile (fire-and-forget): cheap set-difference
+            // gate — a DISTINCT scan + IN chunks, no API calls when nothing
+            // is missing; re-embeds stales after embedder config changes.
+            if (config?.embedder && sessionIndex) {
+              sessionIndex
+                .reconcileOmEmbeddings()
+                .then((r) => {
+                  if (r.embedded > 0) {
+                    safeSetStatus("session-search", `OM embeddings reconciled: +${r.embedded}`);
+                    setTimeout(() => safeSetStatus("session-search", ""), 5000);
+                  }
+                })
+                .catch(() => {
+                  // reconcile failures retry on the next sync
+                });
+            }
           }
         })
         .catch((err) => {
@@ -160,6 +185,11 @@ export default function (pi: ExtensionAPI) {
               `Sessions synced: ${parts.join(" ")} (${sessionIndex!.size()} total)`
             );
             setTimeout(() => safeSetStatus("session-search", ""), 5000);
+          }
+          // OM reconcile gate (no-op when nothing is missing; retries
+          // embeddings that failed during sync)
+          if (currentConfig?.embedder) {
+            sessionIndex.reconcileOmEmbeddings().catch(() => {});
           }
         } catch {
           // Silent — don't spam on background sync failures
@@ -346,8 +376,57 @@ export default function (pi: ExtensionAPI) {
           "success",
         );
         ctx.ui.setStatus("session-search", "");
+        // OM reconcile gate — no-op when nothing is missing
+        if (currentConfig?.embedder) {
+          sessionIndex
+            .reconcileOmEmbeddings()
+            .then((r) => {
+              if (r.embedded > 0) {
+                try { ctx.ui.notify(`OM embeddings reconciled: +${r.embedded}`, "info"); } catch { /* stale ctx */ }
+              }
+            })
+            .catch(() => {});
+        }
       } catch (err: any) {
         ctx.ui.notify(`Sync failed: ${err.message}`, "error");
+      }
+    },
+  });
+
+  // ------------------------------------------------------------------
+  // OM backfill command
+  // ------------------------------------------------------------------
+
+  pi.registerCommand("session-om-backfill", {
+    description:
+      "Scan all session files for OM memories (pi-blackhole) and backfill the om_memories index + embeddings",
+    handler: async (_args, ctx) => {
+      if (!sessionIndex) {
+        ctx.ui.notify("Session index not ready yet.", "warning");
+        return;
+      }
+      ctx.ui.notify("Scanning session files for OM memories...", "info");
+      try {
+        const r = await sessionIndex.syncOmBackfill((msg) =>
+          ctx.ui.setStatus("session-search", msg)
+        );
+        const s = sessionIndex.omStats();
+        const lines = [
+          `OM backfill: scanned ${formatNum(r.scanned)} files · ${formatNum(r.candidates)} candidate files matched "om." · reparsed ${formatNum(r.sessions)} sessions.`,
+          `Sessions with OM memories: ${formatNum(s.sessionsWithOm)} · Rows: ${formatNum(s.total)} (${formatNum(s.observations)} obs / ${formatNum(s.reflections)} ref · ${formatNum(s.dropped)} dropped) · distinct ids: ${formatNum(s.distinctIds)} · recurrent obs ids (≥2 sessions): ${formatNum(s.recurrentObsIds)}`,
+        ];
+        if (s.vectors !== undefined) {
+          lines.push(
+            `Vectors (active fingerprint): ${formatNum(s.vectors)}` +
+              (r.embedded > 0 ? ` (+${formatNum(r.embedded)} embedded now)` : " (already up to date)") +
+              (r.skippedEmpty > 0 ? ` · ${r.skippedEmpty} ids skipped (empty content)` : ""),
+          );
+        }
+        ctx.ui.notify(lines.join("\n"), "success");
+        ctx.ui.setStatus("session-search", "");
+      } catch (err: any) {
+        ctx.ui.notify(`OM backfill failed: ${err.message}`, "error");
+        ctx.ui.setStatus("session-search", "");
       }
     },
   });
@@ -633,6 +712,151 @@ export default function (pi: ExtensionAPI) {
       };
     },
   });
+
+  // ------------------------------------------------------------------
+  // Tool: om_memory_search
+  // ------------------------------------------------------------------
+
+  // @lat: [[om#Observational Memory#Tools om_memory_search y om_memory_resolve]]
+  pi.registerTool({
+    name: "om_memory_search",
+    label: "Memory Search",
+    description:
+      "Search Observational Memory (OM) facts — timestamped observations and distilled reflections with 12-hex ids — recorded by pi-blackhole in ANY past pi session. Complements session_search (which ranks whole sessions): use this to find specific facts, decisions, or fixes by topic. Hybrid (semantic + keyword) when embeddings are configured, BM25 keyword otherwise. Defaults to active memories; dropped ones are kept for history and queryable via status.",
+    promptSnippet:
+      "Search OM memories (observations/reflections) recorded across past sessions by pi-blackhole — find specific facts and decisions by topic.",
+    promptGuidelines: [
+      "Use om_memory_search to find a specific fact, decision, or fix observed in any past session (e.g. 'vaultwarden resync fix', 'why was waybar groupbar disabled'). Hits are labeled OM memory hits — distinct from session_search's whole-session hits.",
+      "Follow up a memory hit with om_memory_resolve(memoryId) to list every session containing that fact, then session_read(sessionId) for full conversational context. session_read does NOT render OM entries inline.",
+      "Memories exist only where pi-blackhole recorded them. If om_memory_search returns nothing but you expect results, the OM index may need /session-om-backfill.",
+    ],
+    parameters: Type.Object({
+      query: Type.String({ description: "Natural language search query" }),
+      limit: Type.Optional(
+        Type.Number({ description: "Max results to return (default 10, max 25)" })
+      ),
+      kind: Type.Optional(
+        Type.Union([Type.Literal("observation"), Type.Literal("reflection"), Type.Literal("all")], {
+          description: "Memory kind filter (default all)",
+        })
+      ),
+      relevance: Type.Optional(
+        Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("critical")], {
+          description: "Relevance tier filter (observations only)",
+        })
+      ),
+      status: Type.Optional(
+        Type.Union([Type.Literal("active"), Type.Literal("dropped"), Type.Literal("all")], {
+          description: "Tombstone filter (default active)",
+        })
+      ),
+      session: Type.Optional(
+        Type.String({ description: "Restrict to one session UUID" })
+      ),
+    }),
+    async execute(_toolCallId, params, signal) {
+      if (!sessionIndex || sessionIndex.size() === 0) {
+        const msg = !sessionIndex
+          ? "Session index not ready yet."
+          : "Session index is empty — it may still be building. Try again in a moment.";
+        return { content: [{ type: "text", text: msg }], details: {} };
+      }
+
+      const limit = Math.min(params.limit ?? 10, 25);
+
+      try {
+        const filters: OmMemoryFilters = {
+          kind: params.kind ?? "all",
+          relevance: params.relevance,
+          status: params.status ?? "active",
+          session: params.session,
+        };
+        const hits = await sessionIndex.searchMemories(params.query, filters, limit, signal);
+
+        if (hits.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `No OM memories found for: "${params.query}" (kind=${filters.kind}, status=${filters.status}).\n` +
+                  "Memories exist only where pi-blackhole recorded them; if you expect results, run /session-om-backfill (or /session-sync) first.",
+              },
+            ],
+            details: {},
+          };
+        }
+
+        const stats = sessionIndex.omStats();
+        const hybrid = sessionIndex instanceof SessionIndex;
+        const text = formatMemorySearchOutput(hits, params.query, { hybrid, stats });
+
+        return {
+          content: [{ type: "text", text }],
+          details: { resultCount: hits.length, memoriesIndexed: stats.active },
+        };
+      } catch (err: any) {
+        throw new Error(`om_memory_search failed: ${err.message}`);
+      }
+    },
+  });
+
+  // ------------------------------------------------------------------
+  // Tool: om_memory_resolve
+  // ------------------------------------------------------------------
+
+  // @lat: [[om#Observational Memory#Tools om_memory_search y om_memory_resolve]]
+  pi.registerTool({
+    name: "om_memory_resolve",
+    label: "Memory Resolve",
+    description:
+      "Resolve an OM memory id (12-char hex, from om_memory_search hits) to every session containing that fact — per-session status, observation timestamps, source entries, and total recurrence. Lightweight: follow up with session_read(sessionId) for full conversational context.",
+    promptSnippet:
+      "Resolve an OM memory id to all sessions containing that fact.",
+    parameters: Type.Object({
+      memory_id: Type.String({
+        description: "OM memory id — 12 hex chars (e.g. a1b2c3d4e5f6), from om_memory_search hits",
+        pattern: "^[a-f0-9]{12}$",
+      }),
+    }),
+    async execute(_toolCallId, params) {
+      if (!sessionIndex || sessionIndex.size() === 0) {
+        const msg = !sessionIndex
+          ? "Session index not ready yet."
+          : "Session index is empty.";
+        return { content: [{ type: "text", text: msg }], details: {} };
+      }
+
+      const id = params.memory_id.toLowerCase();
+      if (!MEMORY_ID_PATTERN.test(id)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Invalid memory id "${params.memory_id}" — expected 12 hex chars (e.g. a1b2c3d4e5f6), as shown bracketed in om_memory_search hits.`,
+            },
+          ],
+          details: {},
+        };
+      }
+
+      try {
+        const hits = await sessionIndex.resolveMemory(id);
+        if (hits.length === 0) {
+          return {
+            content: [{ type: "text", text: formatMemoryNotFound(id) }],
+            details: {},
+          };
+        }
+        return {
+          content: [{ type: "text", text: formatMemoryResolve(id, hits) }],
+          details: { sessions: hits.length, recurrence: hits[0].recurrence },
+        };
+      } catch (err: any) {
+        throw new Error(`om_memory_resolve failed: ${err.message}`);
+      }
+    },
+  });
 }
 
 export { truncate, pathToSlug, formatRelativeDate } from "./utils";
@@ -640,3 +864,11 @@ export { slugToProject, buildSummary } from "./utils";
 export { toFtsQuery, buildContent } from "./fts-index";
 export { parseSession } from "./parser";
 export { loadConfig } from "./config";
+export {
+  extractOmMemories,
+  scanFileForOm,
+  capOmMemories,
+  MEMORY_ID_PATTERN,
+} from "./om";
+export type { OmMemoryRow, OmMemoryHit, OmMemoryFilters, OmIndexStats } from "./om";
+export { OmEmbeddingStore, omEmbedderFingerprint } from "./om-embeddings";

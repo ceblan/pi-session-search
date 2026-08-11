@@ -6,6 +6,23 @@ import { discoverSessionFiles, parseSession, readSessionId } from "./parser";
 import type { Embedder } from "./embedder";
 import { buildContent, toFtsQuery } from "./fts-index";
 import { truncate, slugToProject, buildSummary } from "./utils";
+import {
+  OM_TABLE_DDL,
+  OM_INSERT_SQL,
+  OM_SELECT_COLS,
+  omRowToParams,
+  dbRowToOmMemory,
+  buildOmFilterClause,
+  capOmMemories,
+  scanFileForOm,
+  type OmMemoryRow,
+  type OmMemoryFilters,
+  type OmMemoryHit,
+  type OmSessionInfo,
+  type OmIndexStats,
+  type OmBackfillResult,
+} from "./om";
+import { OmEmbeddingStore, type EmbedderFingerprint } from "./om-embeddings";
 
 // ─── FTS side-car (for hybrid search) ────────────────────────────────
 
@@ -17,6 +34,8 @@ class FtsSide {
     this.db.exec(
       "CREATE VIRTUAL TABLE IF NOT EXISTS s USING fts5(id UNINDEXED, name, content, tokenize='porter unicode61')",
     );
+    // OM memories live in their own FTS5 table (FTS5 has no ADD COLUMN)
+    this.db.exec(OM_TABLE_DDL);
   }
   upsert(id: string, name: string, content: string) {
     this.db.exec("BEGIN");
@@ -41,6 +60,132 @@ class FtsSide {
     rows.forEach((r, i) => out.set(String(r.id), i + 1));
     return out;
   }
+
+  // ─── OM memories ───────────────────────────────────────────────
+
+  /** Replace the OM rows of a session atomically. */
+  upsertOm(sessionId: string, rows: OmMemoryRow[]) {
+    this.db.exec("BEGIN");
+    this.db.prepare("DELETE FROM om_memories WHERE session_id = ?").run(sessionId);
+    const insert = this.db.prepare(OM_INSERT_SQL);
+    for (const row of rows) insert.run(...omRowToParams(row));
+    this.db.exec("COMMIT");
+  }
+  deleteOm(sessionId: string) {
+    this.db.prepare("DELETE FROM om_memories WHERE session_id = ?").run(sessionId);
+  }
+  clearOm() { this.db.exec("DELETE FROM om_memories"); }
+  countOm(): number {
+    return (this.db.prepare("SELECT count(*) as c FROM om_memories").get() as any).c;
+  }
+  /** FTS ranks over memory rows, keyed by `${session_id}:${memory_id}` (rank 1 = best). */
+  searchOmRanks(q: string, filters: OmMemoryFilters, limit: number): Map<string, number> {
+    const fts = toFtsQuery(q);
+    const out = new Map<string, number>();
+    if (!fts) return out;
+    const { clauses, args } = buildOmFilterClause(filters);
+    const extra = clauses.length ? ` AND ${clauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT session_id, memory_id FROM om_memories WHERE om_memories MATCH ?${extra} ORDER BY bm25(om_memories) LIMIT ?`,
+      )
+      .all(fts, ...args, limit) as any[];
+    rows.forEach((r, i) => out.set(`${r.session_id}:${r.memory_id}`, i + 1));
+    return out;
+  }
+  /** All rows of a memory id across sessions. */
+  omRowsByMemoryId(memoryId: string): OmMemoryRow[] {
+    const rows = this.db
+      .prepare(`SELECT ${OM_SELECT_COLS} FROM om_memories WHERE memory_id = ?`)
+      .all(memoryId) as any[];
+    return rows.map(dbRowToOmMemory);
+  }
+  /** Structured candidates (scan-filter over UNINDEXED columns) for the cosine side. */
+  omRowsMatching(filters: OmMemoryFilters): OmMemoryRow[] {
+    const { clauses, args } = buildOmFilterClause(filters);
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(`SELECT ${OM_SELECT_COLS} FROM om_memories ${where}`)
+      .all(...args) as any[];
+    return rows.map(dbRowToOmMemory);
+  }
+  /** Recurrence = COUNT(DISTINCT session_id) per memory id. */
+  memoryRecurrences(memoryIds: string[]): Map<string, number> {
+    const out = new Map<string, number>();
+    for (let i = 0; i < memoryIds.length; i += 500) {
+      const chunk = memoryIds.slice(i, i + 500);
+      if (chunk.length === 0) continue;
+      const placeholders = chunk.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(
+          `SELECT memory_id, COUNT(DISTINCT session_id) AS n FROM om_memories WHERE memory_id IN (${placeholders}) GROUP BY memory_id`,
+        )
+        .all(...chunk) as any[];
+      for (const r of rows) out.set(String(r.memory_id), Number(r.n));
+    }
+    return out;
+  }
+  /** Distinct memory ids, optionally only those with some non-empty content row. */
+  distinctOmIds(nonEmptyOnly: boolean): Set<string> {
+    const sql = nonEmptyOnly
+      ? "SELECT DISTINCT memory_id FROM om_memories WHERE content != ''"
+      : "SELECT DISTINCT memory_id FROM om_memories";
+    const rows = this.db.prepare(sql).all() as any[];
+    return new Set(rows.map((r) => String(r.memory_id)));
+  }
+  /** Longest non-empty content per memory id within the given id chunk. */
+  omContentsByIds(ids: string[]): Map<string, string> {
+    const best = new Map<string, string>();
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500);
+      if (chunk.length === 0) continue;
+      const placeholders = chunk.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(`SELECT memory_id, content FROM om_memories WHERE memory_id IN (${placeholders})`)
+        .all(...chunk) as any[];
+      for (const r of rows) {
+        const id = String(r.memory_id);
+        const content = String(r.content ?? "");
+        const cur = best.get(id);
+        if (content && (cur === undefined || content.length > cur.length)) best.set(id, content);
+      }
+    }
+    return best;
+  }
+  /** Aggregate counts for backfill verification. */
+  omStatsRows(): Omit<OmIndexStats, "vectors"> {
+    const agg = this.db
+      .prepare(
+        `SELECT COUNT(*) AS total,
+                SUM(CASE WHEN kind = 'observation' THEN 1 ELSE 0 END) AS obs,
+                SUM(CASE WHEN kind = 'reflection' THEN 1 ELSE 0 END) AS ref,
+                SUM(CASE WHEN status = 'dropped' THEN 1 ELSE 0 END) AS dropped,
+                COUNT(DISTINCT memory_id) AS ids,
+                COUNT(DISTINCT session_id) AS sessions
+         FROM om_memories`,
+      )
+      .get() as any;
+    const recurrent = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM (
+           SELECT memory_id FROM om_memories WHERE kind = 'observation'
+           GROUP BY memory_id HAVING COUNT(DISTINCT session_id) >= 2
+         )`,
+      )
+      .get() as any;
+    const total = Number(agg?.total ?? 0);
+    const dropped = Number(agg?.dropped ?? 0);
+    return {
+      total,
+      observations: Number(agg?.obs ?? 0),
+      reflections: Number(agg?.ref ?? 0),
+      dropped,
+      active: total - dropped,
+      distinctIds: Number(agg?.ids ?? 0),
+      recurrentObsIds: Number(recurrent?.n ?? 0),
+      sessionsWithOm: Number(agg?.sessions ?? 0),
+    };
+  }
 }
 
 // ─── Types ───────────────────────────────────────────────────────────
@@ -56,6 +201,12 @@ interface IndexedSession {
   mtimeMs: number;
   /** File size in bytes when last indexed */
   sizeBytes?: number;
+  /**
+   * Set when any OM memory content was truncated/emptied by the persistence
+   * caps. populateFtsFromIndex re-parses the source file for these entries
+   * to restore verbatim FTS content (falls back to capped rows if gone).
+   */
+  omContentCapped?: boolean;
 }
 
 interface IndexData {
@@ -85,15 +236,27 @@ export function decodeEmbedding(stored: number[] | string): number[] {
  * Strip heavy text fields from ParsedSession before persisting.
  * These are only needed during embedding generation, not at search/list time.
  * Saves ~17MB across 2000 sessions.
+ *
+ * OM memories are preserved (with the double cap: 8K/memory + HARD 16K
+ * aggregate per session, metadata always intact) so the FTS side-car can be
+ * rebuilt from this JSON without silently losing them.
  */
-function stripHeavyFields(session: ParsedSession): ParsedSession {
+function stripHeavyFields(session: ParsedSession): {
+  stripped: ParsedSession;
+  omContentCapped: boolean;
+} {
+  const { rows, capped } = capOmMemories(session.omMemories ?? []);
   return {
-    ...session,
-    userMessages: [],
-    assistantText: "",
-    firstUserMessage: session.firstUserMessage.slice(0, 200),
-    compactionSummaries: session.compactionSummaries.map(s => s.slice(0, 300)),
-    branchSummaries: session.branchSummaries.map(s => s.slice(0, 200)),
+    stripped: {
+      ...session,
+      userMessages: [],
+      assistantText: "",
+      firstUserMessage: session.firstUserMessage.slice(0, 200),
+      compactionSummaries: session.compactionSummaries.map((s) => s.slice(0, 300)),
+      branchSummaries: session.branchSummaries.map((s) => s.slice(0, 200)),
+      omMemories: rows,
+    },
+    omContentCapped: capped,
   };
 }
 
@@ -103,16 +266,23 @@ export class SessionIndex {
   private data: IndexData = { version: INDEX_VERSION, sessions: {} };
   private indexPath: string;
   private fts: FtsSide;
+  private omEmbeddings: OmEmbeddingStore;
+  private omFp: EmbedderFingerprint;
+  /** Lazy cosine cache of OM vectors (active fingerprint only) — null = dirty */
+  private omVectorCache: Map<string, Float32Array> | null = null;
 
   constructor(
     private embedder: Embedder,
     private indexDir: string,
     private extraSessionDirs: string[] = [],
     private extraArchiveDirs: string[] = [],
+    omFingerprint?: EmbedderFingerprint,
   ) {
     mkdirSync(indexDir, { recursive: true });
     this.indexPath = join(indexDir, "session-index.json");
     this.fts = new FtsSide(indexDir);
+    this.omEmbeddings = new OmEmbeddingStore(indexDir);
+    this.omFp = omFingerprint ?? { model: "unknown", dims: 0 };
   }
 
   /** Load existing index from disk. */
@@ -129,7 +299,9 @@ export class SessionIndex {
           if (Array.isArray(entry.embedding)) {
             entry.embedding = encodeEmbedding(entry.embedding);
           }
-          entry.session = stripHeavyFields(entry.session);
+          const { stripped, omContentCapped } = stripHeavyFields(entry.session);
+          entry.session = stripped;
+          if (omContentCapped) entry.omContentCapped = true;
         }
         parsed.version = INDEX_VERSION;
         this.data = parsed;
@@ -151,7 +323,13 @@ export class SessionIndex {
    * Populate the FTS side-car from existing index data.
    * Used when the JSON index is loaded but the FTS DB is empty (e.g. first
    * run after upgrade, or if the .db file was deleted).
+   *
+   * OM rows are repopulated from the persisted (capped) omMemories; entries
+   * flagged omContentCapped get a directed re-parse of their source file to
+   * restore verbatim content (falling back to the capped rows — metadata
+   * intact — when the file is gone).
    */
+  // @lat: [[om#Observational Memory#Persistencia JSON con doble cap]]
   private populateFtsFromIndex(): void {
     for (const [id, entry] of Object.entries(this.data.sessions)) {
       const s = entry.session;
@@ -164,6 +342,18 @@ export class SessionIndex {
       if (s.filesModified?.length) parts.push(s.filesModified.join(" "));
       const content = parts.join("\n\n");
       this.fts.upsert(id, s.name ?? "", content);
+
+      // OM rows — never leave them silently empty on rebuild
+      let omRows = s.omMemories ?? [];
+      if (entry.omContentCapped && existsSync(s.file)) {
+        try {
+          const reparsed = parseSession(s.file, s.archived);
+          if (reparsed) omRows = reparsed.omMemories;
+        } catch {
+          // keep capped rows as fallback
+        }
+      }
+      this.fts.upsertOm(id, omRows);
     }
   }
 
@@ -249,6 +439,7 @@ export class SessionIndex {
       if (!discoveredIds.has(id)) {
         delete this.data.sessions[id];
         this.fts.delete(id);
+        this.fts.deleteOm(id);
         removed++;
       }
     }
@@ -287,6 +478,7 @@ export class SessionIndex {
 
     if (toEmbed.length === 0) {
       if (moved > 0 || removed > 0) this.save();
+      if (removed > 0) this.gcOmEmbeddings();
       return { added, updated, removed, moved };
     }
 
@@ -318,15 +510,19 @@ export class SessionIndex {
           if (!embedding) continue; // failed to embed
 
           const isUpdate = !!this.data.sessions[item.id];
+          const { stripped, omContentCapped } = stripHeavyFields(session);
 
           this.data.sessions[item.id] = {
-            session: stripHeavyFields(session),
+            session: stripped,
             summary: buildSummary(session),
             embedding: encodeEmbedding(embedding),
             mtimeMs: item.mtimeMs,
             sizeBytes: item.sizeBytes,
+            omContentCapped: omContentCapped || undefined,
           };
           this.fts.upsert(item.id, session.name ?? "", buildContent(session));
+          // OM rows verbatim in FTS (the JSON copy is the capped one)
+          this.fts.upsertOm(item.id, session.omMemories);
 
           if (isUpdate) updated++;
           else added++;
@@ -335,20 +531,256 @@ export class SessionIndex {
         onProgress?.(`Embedding batch failed: ${err.message}`);
       }
 
+      // ── OM memory embeddings: incremental, per distinct memory_id ──
+      // Ids already embedded with the active fingerprint are skipped for
+      // free (content-hash dedup); failures retry on the next sync/reconcile.
+      try {
+        const omRows = parsed.flatMap(({ session }) => session.omMemories);
+        if (omRows.length > 0) {
+          const contentById = new Map<string, string>();
+          for (const r of omRows) {
+            const cur = contentById.get(r.memoryId);
+            if (r.content && (cur === undefined || r.content.length > cur.length)) {
+              contentById.set(r.memoryId, r.content);
+            }
+          }
+          const missing = this.omEmbeddings.missingIds([...contentById.keys()], this.omFp);
+          if (missing.length > 0) {
+            const texts = missing.map((id) => contentById.get(id)!.slice(0, 8000));
+            const vecs = await this.embedder.embedBatch(texts);
+            for (let k = 0; k < missing.length; k++) {
+              const v = vecs[k];
+              if (v) this.omEmbeddings.put(missing[k], v, this.omFp);
+            }
+            this.omVectorCache = null; // invalidate the cosine cache
+          }
+        }
+      } catch (err: any) {
+        onProgress?.(`OM embedding batch failed: ${err.message}`);
+      }
+
       onProgress?.(
         `Indexed ${Math.min(i + BATCH_SIZE, toEmbed.length)}/${toEmbed.length}...`
       );
     }
 
     this.save();
+    if (removed > 0) this.gcOmEmbeddings();
     return { added, updated, removed, moved };
   }
 
-  /** Full rebuild — clear and re-index everything. */
+  /** Best-effort GC of orphaned OM vectors after session removals. */
+  private gcOmEmbeddings(): void {
+    try {
+      this.omEmbeddings.gc(this.fts.distinctOmIds(false));
+      this.omVectorCache = null;
+    } catch {
+      // best-effort — next sync retries
+    }
+  }
+
+  /** Full rebuild — clear and re-index everything. OM embedding vectors are
+   *  deliberately kept (contents don't change; ids are reused). */
   async rebuild(onProgress?: (msg: string) => void): Promise<void> {
     this.data = { version: INDEX_VERSION, sessions: {} };
     this.fts.clear();
+    this.fts.clearOm();
     await this.sync(onProgress);
+  }
+
+  /**
+   * Reconcile OM embeddings with the active fingerprint.
+   * Set-difference gate (never cardinality — equal counts could hide an
+   * orphan vector plus a missing one): computes missing ids over distinct
+   * non-empty ids in om_memories; when nothing is missing this is a real
+   * no-op (one DISTINCT scan + IN chunks, no API calls). Otherwise
+   * (re-)embeds stales/missing FROM THE STORED om_memories.content (longest
+   * non-empty row per id) — no session re-parse, which matters after an
+   * embedder change (incremental sync skips unchanged files). Ids whose
+   * rows are all empty (capped fallback, file gone) are skipped/reported —
+   * they stay resolvable via om_memory_resolve (metadata intact).
+   */
+  // @lat: [[om#Observational Memory#Backfill y reconcile]]
+  async reconcileOmEmbeddings(
+    onProgress?: (msg: string) => void,
+  ): Promise<{ embedded: number; skippedEmpty: number; alreadyFresh: number }> {
+    const nonEmptyIds = this.fts.distinctOmIds(true);
+    const allIds = this.fts.distinctOmIds(false);
+    const soloEmpty = allIds.size - nonEmptyIds.size;
+    const missing = this.omEmbeddings.missingIds([...nonEmptyIds], this.omFp);
+    const alreadyFresh = nonEmptyIds.size - missing.length;
+    if (missing.length === 0) {
+      return { embedded: 0, skippedEmpty: soloEmpty, alreadyFresh };
+    }
+
+    const contentById = this.fts.omContentsByIds(missing);
+    const embeddable = missing.filter((id) => contentById.has(id));
+    const skippedEmpty = soloEmpty + (missing.length - embeddable.length);
+    if (skippedEmpty > 0) {
+      onProgress?.(`OM reconcile: ${skippedEmpty} ids skipped (empty content only)`);
+    }
+
+    let embedded = 0;
+    const CHUNK = 500;
+    for (let i = 0; i < embeddable.length; i += CHUNK) {
+      const chunk = embeddable.slice(i, i + CHUNK);
+      const texts = chunk.map((id) => contentById.get(id)!.slice(0, 8000));
+      const vecs = await this.embedder.embedBatch(texts);
+      for (let k = 0; k < chunk.length; k++) {
+        const v = vecs[k];
+        if (v) {
+          this.omEmbeddings.put(chunk[k], v, this.omFp);
+          embedded++;
+        }
+      }
+      onProgress?.(
+        `OM embeddings: ${Math.min(i + CHUNK, embeddable.length)}/${embeddable.length}...`,
+      );
+    }
+    if (embedded > 0) this.omVectorCache = null;
+    return { embedded, skippedEmpty, alreadyFresh };
+  }
+
+  /**
+   * Hybrid memory search: cosine over OM vectors + FTS5 BM25, fused per row
+   * (rowKey = session_id:memory_id) via Reciprocal Rank Fusion (k=60).
+   * Rows sharing a memory_id share its vector; recurrence is annotated after.
+   */
+  // @lat: [[om#Observational Memory#Búsqueda híbrida RRF]]
+  async searchMemories(
+    query: string,
+    filters: OmMemoryFilters = {},
+    limit = 10,
+    signal?: AbortSignal,
+  ): Promise<OmMemoryHit[]> {
+    const candidates = this.fts.omRowsMatching(filters);
+    if (candidates.length === 0) return [];
+
+    const queryEmbedding = await this.embedder.embed(query);
+    if (signal?.aborted) return [];
+
+    // Lazy cosine cache — ACTIVE fingerprint only, never mixes vector
+    // spaces. ~11.4K × 512 dims × 4B ≈ 23.5MB heap at current scale.
+    if (!this.omVectorCache) {
+      this.omVectorCache = this.omEmbeddings.loadAll(this.omFp);
+    }
+
+    const poolSize = Math.max(limit * 5, 100);
+    const rowKey = (r: OmMemoryRow) => `${r.sessionId}:${r.memoryId}`;
+
+    // Cosine ranks over candidate rows (vector shared per memory_id)
+    const cosineRanks = new Map<string, number>();
+    const scored = candidates
+      .map((r) => {
+        const vec = this.omVectorCache!.get(r.memoryId);
+        return { r, score: vec ? cosineSimilarity(queryEmbedding, vec) : null };
+      })
+      .filter((s): s is { r: OmMemoryRow; score: number } => s.score !== null)
+      .sort((a, b) => b.score - a.score);
+    scored.slice(0, poolSize).forEach((s, i) => cosineRanks.set(rowKey(s.r), i + 1));
+
+    const ftsRanks = this.fts.searchOmRanks(query, filters, poolSize);
+
+    // RRF fusion: score = Σ 1 / (k + rank)
+    const K = 60;
+    const fused = new Map<string, number>();
+    for (const [key, r] of cosineRanks) fused.set(key, (fused.get(key) ?? 0) + 1 / (K + r));
+    for (const [key, r] of ftsRanks) fused.set(key, (fused.get(key) ?? 0) + 1 / (K + r));
+
+    const sorted = [...fused.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit);
+    const byKey = new Map(candidates.map((r) => [rowKey(r), r]));
+    const ids = [...new Set(sorted.map(([key]) => byKey.get(key)!.memoryId))];
+    const recurrences = this.fts.memoryRecurrences(ids);
+
+    return sorted.map(([key, score]) => {
+      const row = byKey.get(key)!;
+      return {
+        row,
+        recurrence: recurrences.get(row.memoryId) ?? 1,
+        score,
+        session: this.sessionInfoFor(row.sessionId),
+      };
+    });
+  }
+
+  /** All rows of a memory id across every indexed session (om_memory_resolve). */
+  async resolveMemory(memoryId: string): Promise<OmMemoryHit[]> {
+    const rows = this.fts.omRowsByMemoryId(memoryId);
+    const recurrences = this.fts.memoryRecurrences([memoryId]);
+    return rows.map((row) => ({
+      row,
+      recurrence: recurrences.get(memoryId) ?? 1,
+      score: 0,
+      session: this.sessionInfoFor(row.sessionId),
+    }));
+  }
+
+  /** Aggregate counts of the OM tables (backfill verification §6.4). */
+  omStats(): OmIndexStats {
+    return { ...this.fts.omStatsRows(), vectors: this.omEmbeddings.count(this.omFp) };
+  }
+
+  /**
+   * Selective OM backfill: scan every session file, reparse OM candidates,
+   * upsert folded rows into FTS (verbatim) AND into the JSON index (capped,
+   * so a future sidecar rebuild cannot silently wipe them), then reconcile
+   * embeddings. Resumable: already-embedded ids are skipped by missingIds.
+   */
+  // @lat: [[om#Observational Memory#Backfill y reconcile]]
+  async syncOmBackfill(onProgress?: (msg: string) => void): Promise<OmBackfillResult> {
+    const discovered = discoverSessionFiles(this.extraSessionDirs, this.extraArchiveDirs);
+    const candidates: { file: string; archived: boolean }[] = [];
+    let scanned = 0;
+    for (const d of discovered) {
+      scanned++;
+      if (scanFileForOm(d.file)) candidates.push(d);
+      if (scanned % 500 === 0) onProgress?.(`Scanned ${scanned}/${discovered.length} session files...`);
+    }
+    if (candidates.length > 0) onProgress?.(`${candidates.length} files contain OM — reparsing...`);
+
+    let sessions = 0;
+    let rows = 0;
+    let done = 0;
+    for (const c of candidates) {
+      const session = parseSession(c.file, c.archived);
+      if (session && session.userMessageCount > 0) {
+        this.fts.upsertOm(session.id, session.omMemories);
+        const existing = this.data.sessions[session.id];
+        if (existing) {
+          const { rows: cappedRows, capped } = capOmMemories(session.omMemories);
+          existing.session.omMemories = cappedRows;
+          existing.omContentCapped = capped || undefined;
+        }
+        sessions++;
+        rows += session.omMemories.length;
+      }
+      done++;
+      if (done % 50 === 0) onProgress?.(`Reparsed ${done}/${candidates.length} OM files...`);
+    }
+    if (sessions > 0) this.save();
+
+    const rec = await this.reconcileOmEmbeddings(onProgress);
+    return {
+      scanned,
+      candidates: candidates.length,
+      sessions,
+      rows,
+      embedded: rec.embedded,
+      skippedEmpty: rec.skippedEmpty,
+    };
+  }
+
+  private sessionInfoFor(sessionId: string): OmSessionInfo | undefined {
+    const entry = this.data.sessions[sessionId];
+    if (!entry) return undefined;
+    const s = entry.session;
+    return {
+      id: sessionId,
+      name: s.name,
+      firstUserMessage: s.firstUserMessage ?? "",
+      startedAt: s.startedAt,
+      projectSlug: s.projectSlug,
+    };
   }
 
   /**
@@ -458,6 +890,7 @@ export class SessionIndex {
 
   close(): void {
     this.fts.close();
+    this.omEmbeddings.close();
   }
 }
 
@@ -479,7 +912,7 @@ export interface ListFilters {
 
 // ─── Utilities ───────────────────────────────────────────────────────
 
-function cosineSimilarity(a: number[], b: number[]): number {
+function cosineSimilarity(a: ArrayLike<number>, b: ArrayLike<number>): number {
   if (a.length !== b.length) return 0;
   let dot = 0,
     normA = 0,

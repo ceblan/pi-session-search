@@ -5,6 +5,21 @@ import type { ParsedSession } from "./parser";
 import { discoverSessionFiles, parseSession, readSessionId } from "./parser";
 import type { SearchResult, ListFilters } from "./session-index";
 import { truncate, buildSummary } from "./utils";
+import {
+  OM_TABLE_DDL,
+  OM_INSERT_SQL,
+  OM_SELECT_COLS,
+  omRowToParams,
+  dbRowToOmMemory,
+  buildOmFilterClause,
+  scanFileForOm,
+  type OmMemoryRow,
+  type OmMemoryFilters,
+  type OmMemoryHit,
+  type OmSessionInfo,
+  type OmIndexStats,
+  type OmBackfillResult,
+} from "./om";
 
 /**
  * SQLite FTS5-backed session index. API-compatible with SessionIndex.
@@ -64,6 +79,10 @@ export class FtsSessionIndex {
         tokenize='porter unicode61'
       );
     `);
+
+    // OM memories live in their own FTS5 table (FTS5 has no ADD COLUMN).
+    // IF NOT EXISTS — no migration, the sessions schema stays untouched.
+    this.db.exec(OM_TABLE_DDL);
   }
 
   save(): void { /* auto-persisted */ }
@@ -114,10 +133,12 @@ export class FtsSessionIndex {
 
     // Remove sessions no longer present
     const delStmt = this.db.prepare("DELETE FROM sessions WHERE id = ?");
+    const delOmStmt = this.db.prepare("DELETE FROM om_memories WHERE session_id = ?");
     this.db.exec("BEGIN");
     for (const id of currentIds) {
       if (!idToFile.has(id)) {
         delStmt.run(id);
+        delOmStmt.run(id);
         removed++;
       }
     }
@@ -155,6 +176,8 @@ export class FtsSessionIndex {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const replaceDel = this.db.prepare("DELETE FROM sessions WHERE id = ?");
+    const omDel = this.db.prepare("DELETE FROM om_memories WHERE session_id = ?");
+    const omInsert = this.db.prepare(OM_INSERT_SQL);
 
     this.db.exec("BEGIN");
     let done = 0;
@@ -179,6 +202,9 @@ export class FtsSessionIndex {
         session.name ?? "",
         content,
       );
+      // OM rows: replace atomically with the session row (same transaction)
+      omDel.run(session.id);
+      for (const row of session.omMemories) omInsert.run(...omRowToParams(row));
       if (isUpdate) updated++; else added++;
       done++;
       if (done % 25 === 0) onProgress?.(`Indexed ${done}/${toIngest.length}...`);
@@ -190,6 +216,7 @@ export class FtsSessionIndex {
 
   async rebuild(onProgress?: (msg: string) => void): Promise<void> {
     this.db.exec("DELETE FROM sessions");
+    this.db.exec("DELETE FROM om_memories");
     await this.sync(onProgress);
   }
 
@@ -248,6 +275,177 @@ export class FtsSessionIndex {
       session: JSON.parse(String(r.json)) as ParsedSession,
       summary: String(r.summary ?? ""),
     }));
+  }
+
+  // ─── OM memories ─────────────────────────────────────────────────
+
+  /**
+   * BM25-only memory search. This mode has no embedder by construction, so
+   * the cosine side is unavailable — documented FTS-only degradation; the
+   * output contract is the same as the hybrid index.
+   */
+  // @lat: [[om#Observational Memory#Búsqueda híbrida RRF]]
+  async searchMemories(
+    query: string,
+    filters: OmMemoryFilters = {},
+    limit = 10,
+    _signal?: AbortSignal,
+  ): Promise<OmMemoryHit[]> {
+    const fts = toFtsQuery(query);
+    if (!fts) return [];
+    const { clauses, args } = buildOmFilterClause(filters);
+    const extra = clauses.length ? ` AND ${clauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT ${OM_SELECT_COLS}, bm25(om_memories) AS score FROM om_memories WHERE om_memories MATCH ?${extra} ORDER BY score LIMIT ?`,
+      )
+      .all(fts, ...args, limit) as any[];
+    return this.annotateMemoryHits(
+      rows.map((r) => ({ row: dbRowToOmMemory(r), rawScore: Number(r.score) })),
+    );
+  }
+
+  /** All rows of a memory id across every indexed session. */
+  async resolveMemory(memoryId: string): Promise<OmMemoryHit[]> {
+    const rows = this.db
+      .prepare(`SELECT ${OM_SELECT_COLS} FROM om_memories WHERE memory_id = ?`)
+      .all(memoryId) as any[];
+    return this.annotateMemoryHits(rows.map((r) => ({ row: dbRowToOmMemory(r), rawScore: 0 })));
+  }
+
+  /** Recurrence = COUNT(DISTINCT session_id) per memory id. */
+  memoryRecurrences(memoryIds: string[]): Map<string, number> {
+    const out = new Map<string, number>();
+    for (let i = 0; i < memoryIds.length; i += 500) {
+      const chunk = memoryIds.slice(i, i + 500);
+      if (chunk.length === 0) continue;
+      const placeholders = chunk.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(
+          `SELECT memory_id, COUNT(DISTINCT session_id) AS n FROM om_memories WHERE memory_id IN (${placeholders}) GROUP BY memory_id`,
+        )
+        .all(...chunk) as any[];
+      for (const r of rows) out.set(String(r.memory_id), Number(r.n));
+    }
+    return out;
+  }
+
+  /** Aggregate counts of the om_memories table (backfill verification). */
+  omStats(): OmIndexStats {
+    const agg = this.db
+      .prepare(
+        `SELECT COUNT(*) AS total,
+                SUM(CASE WHEN kind = 'observation' THEN 1 ELSE 0 END) AS obs,
+                SUM(CASE WHEN kind = 'reflection' THEN 1 ELSE 0 END) AS ref,
+                SUM(CASE WHEN status = 'dropped' THEN 1 ELSE 0 END) AS dropped,
+                COUNT(DISTINCT memory_id) AS ids,
+                COUNT(DISTINCT session_id) AS sessions
+         FROM om_memories`,
+      )
+      .get() as any;
+    const recurrent = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM (
+           SELECT memory_id FROM om_memories WHERE kind = 'observation'
+           GROUP BY memory_id HAVING COUNT(DISTINCT session_id) >= 2
+         )`,
+      )
+      .get() as any;
+    const total = Number(agg?.total ?? 0);
+    const dropped = Number(agg?.dropped ?? 0);
+    return {
+      total,
+      observations: Number(agg?.obs ?? 0),
+      reflections: Number(agg?.ref ?? 0),
+      dropped,
+      active: total - dropped,
+      distinctIds: Number(agg?.ids ?? 0),
+      recurrentObsIds: Number(recurrent?.n ?? 0),
+      sessionsWithOm: Number(agg?.sessions ?? 0),
+    };
+  }
+
+  /**
+   * Selective OM backfill: scan every session file for the OM marker,
+   * reparse candidates, and upsert folded rows — even when sizeBytes has
+   * not changed (unlike the incremental sync).
+   */
+  async syncOmBackfill(onProgress?: (msg: string) => void): Promise<OmBackfillResult> {
+    const discovered = discoverSessionFiles(this.extraSessionDirs, this.extraArchiveDirs);
+    const candidates: { file: string; archived: boolean }[] = [];
+    let scanned = 0;
+    for (const d of discovered) {
+      scanned++;
+      if (scanFileForOm(d.file)) candidates.push(d);
+      if (scanned % 500 === 0) onProgress?.(`Scanned ${scanned}/${discovered.length} session files...`);
+    }
+    if (candidates.length > 0) onProgress?.(`${candidates.length} files contain OM — reparsing...`);
+
+    const omDel = this.db.prepare("DELETE FROM om_memories WHERE session_id = ?");
+    const omInsert = this.db.prepare(OM_INSERT_SQL);
+    let sessions = 0;
+    let rows = 0;
+    let done = 0;
+    this.db.exec("BEGIN");
+    for (const c of candidates) {
+      const session = parseSession(c.file, c.archived);
+      if (session && session.userMessageCount > 0) {
+        omDel.run(session.id);
+        for (const row of session.omMemories) omInsert.run(...omRowToParams(row));
+        sessions++;
+        rows += session.omMemories.length;
+      }
+      done++;
+      if (done % 50 === 0) onProgress?.(`Reparsed ${done}/${candidates.length} OM files...`);
+    }
+    this.db.exec("COMMIT");
+    return { scanned, candidates: candidates.length, sessions, rows, embedded: 0, skippedEmpty: 0 };
+  }
+
+  /** No embeddings in FTS-only mode — reconcile is a no-op by construction. */
+  async reconcileOmEmbeddings(): Promise<{ embedded: number; skippedEmpty: number; alreadyFresh: number }> {
+    return { embedded: 0, skippedEmpty: 0, alreadyFresh: 0 };
+  }
+
+  /** Shared hit annotation: recurrence + session info lookup. */
+  private annotateMemoryHits(items: { row: OmMemoryRow; rawScore: number }[]): OmMemoryHit[] {
+    const ids = [...new Set(items.map((i) => i.row.memoryId))];
+    const recurrences = this.memoryRecurrences(ids);
+    const sessionIds = [...new Set(items.map((i) => i.row.sessionId))];
+    const sessions = this.sessionInfoByIds(sessionIds);
+    return items.map(({ row, rawScore }) => ({
+      row,
+      recurrence: recurrences.get(row.memoryId) ?? 1,
+      score: 1 / (1 + Math.abs(rawScore)),
+      session: sessions.get(row.sessionId),
+    }));
+  }
+
+  private sessionInfoByIds(ids: string[]): Map<string, OmSessionInfo> {
+    const out = new Map<string, OmSessionInfo>();
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500);
+      if (chunk.length === 0) continue;
+      const placeholders = chunk.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(`SELECT id, json FROM sessions WHERE id IN (${placeholders})`)
+        .all(...chunk) as any[];
+      for (const r of rows) {
+        try {
+          const s = JSON.parse(String(r.json)) as ParsedSession;
+          out.set(String(r.id), {
+            id: String(r.id),
+            name: s.name,
+            firstUserMessage: s.firstUserMessage ?? "",
+            startedAt: s.startedAt,
+            projectSlug: s.projectSlug,
+          });
+        } catch {
+          // malformed json row — skip session info, hit still renders
+        }
+      }
+    }
+    return out;
   }
 
   close(): void {
