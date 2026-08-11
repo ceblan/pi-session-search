@@ -8,6 +8,7 @@ Index, summarize, and search past [pi](https://github.com/badlogic/pi-mono) codi
 - **Hybrid search** — When an embedder is configured, combines cosine similarity + BM25 via Reciprocal Rank Fusion for best-of-both-worlds retrieval
 - **Browse & filter** — List sessions by project, date range, archive status (`session_list`)
 - **Read conversations** — View the full conversation from any past session (`session_read`)
+- **Observational Memory search** — Indexes OM memories (observations/reflections) recorded by the pi-blackhole extension into session files, searchable cross-session via `om_memory_search` / `om_memory_resolve`
 - **Auto-indexing** — Parses JSONL session files on startup, tracks changes incrementally
 - **Archive support** — Indexes both `~/.pi/agent/sessions/` and `~/.pi/agent/sessions-archive/`
 - **Multiple embedders** — OpenAI, Mistral, AWS Bedrock, local Ollama, or any OpenAI-compatible API
@@ -88,6 +89,26 @@ session_read(session="<file-path-or-uuid>")
 session_read(session="<id>", offset=50, limit=50)
 ```
 
+### Search OM memories (requires pi-blackhole recordings)
+```
+om_memory_search(query="vaultwarden resync fix")
+om_memory_search(query="waybar config", kind="reflection", status="active")
+om_memory_resolve(memory_id="a1b2c3d4e5f6")
+```
+
+## Observational Memory search
+
+If you run the pi-blackhole extension (observational memory), it persists timestamped **observations** and distilled **reflections** as `om.*` custom entries and `om.folded` compaction snapshots inside the session JSONL files. pi-session-search extracts them at index time — **no changes or runtime push from pi-blackhole needed** — into a dedicated FTS5 table `om_memories`, with per-memory embeddings in a separate `om-embeddings.db` file when an embedder is configured.
+
+- **Two tools**: `om_memory_search` (hybrid RRF over memories; filters `kind`, `relevance`, `status`, `session`; `status:"active"` by default so tombstoned memories stay out of the way) and `om_memory_resolve` (one id → every session containing that fact, with per-session status and recurrence).
+- **Provenance-labeled output** — hits are tagged as OM memory hits (pi-session-search index) and always show cross-session recurrence (`Aparece en N sesiones`), with follow-ups to `om_memory_resolve(id)` / `session_read(sessionId)`.
+- **Fold semantics mirror pi-blackhole**: first-valid-record-wins dedup by content-hash id (custom entries and compaction snapshots merge without duplicating), session-local tombstones (`dropped` in one session, possibly `active` in another).
+- **Backfill**: existing sessions are indexed on demand — run `/session-om-backfill` once to scan all session files and populate `om_memories` (+ embeddings) without re-embedding whole sessions.
+- **Storage layout**: `om_memories` lives inside `sessions-fts.db` (FTS mode) or `hybrid-fts.db` (hybrid mode); `om_embeddings` lives in its own `om-embeddings.db` so it survives sidecar rebuilds. Each embedding row records the embedder fingerprint (`model`+`dims`) — after changing the embedder config, stale vectors are re-embedded automatically from stored content (`reconcileOmEmbeddings`, runs after startup sync).
+- **Privacy**: embedding OM content sends it to your embedding provider — same as session content in hybrid mode today. FTS-only mode keeps everything local.
+
+Note: `session_read` does not render OM entries inline (planned); use `om_memory_resolve` / `om_memory_search` for OM content.
+
 ## Commands
 
 | Command | Description |
@@ -95,6 +116,7 @@ session_read(session="<id>", offset=50, limit=50)
 | `/session-embeddings-setup` | Configure embedding provider for hybrid search |
 | `/session-sync` | Force an immediate incremental re-sync |
 | `/session-reindex` | Force full re-index of all sessions |
+| `/session-om-backfill` | Scan all session files for OM memories and backfill `om_memories` + embeddings |
 
 ## How It Works
 
@@ -125,6 +147,7 @@ Tested against a 2,159-session corpus: hybrid surfaces **75% more relevant docum
 - Index stored at `~/.pi/session-search/index/`
 - Incremental sync on startup + every 5 minutes
 - Two separate SQLite DBs: `sessions-fts.db` (pure-FTS mode) and `hybrid-fts.db` (side-car for embedder mode)
+- OM memories in an `om_memories` FTS5 table inside those DBs; OM embedding vectors in a third DB, `om-embeddings.db` (fingerprinted by embedder model+dims)
 - Switching modes doesn't corrupt state
 
 ## Environment Variables

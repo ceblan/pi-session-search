@@ -18,11 +18,13 @@ Se divide en: (1) entrypoint de extensión pi, (2) dos índices intercambiables 
 - Parser JSONL: [[src/parser.ts#parseSession]] y [[src/parser.ts#discoverSessionFiles]]
 - Lector de conversación: [[src/reader.ts#readSessionConversation]]
 - Utilidades: [[src/utils.ts#buildSummary]] y helpers relacionados
+- Observational Memory (OM): [[om#Observational Memory]] — extracción/fold ([[src/om.ts]]), store de embeddings ([[src/om-embeddings.ts]]), formato de salida ([[src/om-format.ts]])
 
 ## Documentación interna
 
 Sección transversal que agrupa documentación de las herramientas internas del proyecto (tracker de commits, etc.).
 
+- [[om]] — integración Observational Memory (extracción, esquema, tools, backfill)
 - [[last-commit]] — tracking del último commit revisado por el documentator
 
 ## Directorios y artefactos persistentes
@@ -33,6 +35,7 @@ El paquete guarda configuración e índices bajo `~/.pi/session-search/`, tal co
 - Índices: `~/.pi/session-search/index/`
   - Modo FTS-only: `sessions-fts.db`
   - Modo híbrido: `session-index.json` (metadatos + embeddings) y `hybrid-fts.db` (side-car FTS)
+  - Memorias OM: tabla `om_memories` dentro de esas DBs + vectores en `om-embeddings.db` (fichero propio, fingerprinted por embedder) — ver [[om#Observational Memory]]
 
 ## Flujo de trabajo (end-to-end)
 
