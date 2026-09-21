@@ -124,6 +124,12 @@ El `projectSlug` se deriva del nombre del directorio contenedor del `.jsonl` (si
 
 Ambos índices implementan operaciones similares: `load()`, `sync()`, `rebuild()`, `search()`, `list()`, `get()` y `size()`, pero difieren en su backend y señales.
 
+### Regla de background: unref() obligatorio
+
+Todos los timers de background DEBEN hacer `unref()`: pi sale en print mode drenando el event loop, y un handle activo cuelga el proceso para siempre.
+
+Detalle: aplica al interval de sync creado en `startIndex`, al timeout de la carrera de sync inicial y a los timers de limpieza de status. Verificado el 2026-09-22 tras el upgrade a pi 0.87.0 (commit `5c19dbc`).
+
 ### Descubrimiento de sesiones
 
 La función [[src/parser.ts#discoverSessionFiles]] escanea recursivamente directorios por defecto y extra (`sessions` y `sessions-archive`), filtrando `.jsonl` y excluyendo `pins.json` y `active-sessions.json`.

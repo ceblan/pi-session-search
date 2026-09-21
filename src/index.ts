@@ -124,7 +124,11 @@ export default function (pi: ExtensionAPI) {
         sessionIndex.sync(
           (msg: string) => safeSetStatus("session-search", msg)
         ),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), SYNC_TIMEOUT_MS)),
+        // unref: this timer must not keep the process alive in print mode
+        new Promise<null>((resolve) => {
+          const t = setTimeout(() => resolve(null), SYNC_TIMEOUT_MS);
+          t.unref?.();
+        }),
       ])
         .then((syncResult) => {
           if (syncResult === null) {
@@ -143,7 +147,7 @@ export default function (pi: ExtensionAPI) {
                 "session-search",
                 `Sessions: ${parts.join(" ")} (${sessionIndex!.size()} total)`
               );
-              setTimeout(() => safeSetStatus("session-search", ""), 5000);
+              setTimeout(() => safeSetStatus("session-search", ""), 5000).unref?.();
             }
             // OM embedding reconcile (fire-and-forget): cheap set-difference
             // gate — a DISTINCT scan + IN chunks, no API calls when nothing
@@ -154,7 +158,7 @@ export default function (pi: ExtensionAPI) {
                 .then((r) => {
                   if (r.embedded > 0) {
                     safeSetStatus("session-search", `OM embeddings reconciled: +${r.embedded}`);
-                    setTimeout(() => safeSetStatus("session-search", ""), 5000);
+                    setTimeout(() => safeSetStatus("session-search", ""), 5000).unref?.();
                   }
                 })
                 .catch(() => {
@@ -168,7 +172,10 @@ export default function (pi: ExtensionAPI) {
           safeSetStatus("session-search", "");
         });
 
-      // Periodic background sync to pick up new/changed sessions
+      // Periodic background sync to pick up new/changed sessions.
+      // unref: the interval must never keep the event loop alive on its own
+      // (pi -p / print mode exits by draining the loop; an active interval
+      // would hang the process forever).
       syncTimer = setInterval(async () => {
         if (!sessionIndex) return;
         try {
@@ -184,7 +191,7 @@ export default function (pi: ExtensionAPI) {
               "session-search",
               `Sessions synced: ${parts.join(" ")} (${sessionIndex!.size()} total)`
             );
-            setTimeout(() => safeSetStatus("session-search", ""), 5000);
+            setTimeout(() => safeSetStatus("session-search", ""), 5000).unref?.();
           }
           // OM reconcile gate (no-op when nothing is missing; retries
           // embeddings that failed during sync)
@@ -195,6 +202,7 @@ export default function (pi: ExtensionAPI) {
           // Silent — don't spam on background sync failures
         }
       }, SYNC_INTERVAL_MS);
+      syncTimer.unref?.();
     } catch (err: any) {
       safeNotify(`session-search init failed: ${err.message}`, "error");
     }
