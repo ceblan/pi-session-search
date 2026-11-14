@@ -1,11 +1,11 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
 import type { ParsedSession } from "./parser";
 import { discoverSessionFiles, parseSession, readSessionId } from "./parser";
 import type { Embedder } from "./embedder";
 import { buildContent, toFtsQuery } from "./fts-index";
-import { truncate, slugToProject, buildSummary } from "./utils";
+import { truncate, slugToProject, buildSummary, openIndexDb, withTransaction } from "./utils";
 import {
   OM_TABLE_DDL,
   OM_INSERT_SQL,
@@ -29,8 +29,7 @@ import { OmEmbeddingStore, type EmbedderFingerprint } from "./om-embeddings";
 class FtsSide {
   private db: DatabaseSync;
   constructor(indexDir: string) {
-    this.db = new DatabaseSync(join(indexDir, "hybrid-fts.db"));
-    this.db.exec("PRAGMA busy_timeout = 5000;");
+    this.db = openIndexDb(join(indexDir, "hybrid-fts.db"));
     this.db.exec(
       "CREATE VIRTUAL TABLE IF NOT EXISTS s USING fts5(id UNINDEXED, name, content, tokenize='porter unicode61')",
     );
@@ -38,10 +37,10 @@ class FtsSide {
     this.db.exec(OM_TABLE_DDL);
   }
   upsert(id: string, name: string, content: string) {
-    this.db.exec("BEGIN");
-    this.db.prepare("DELETE FROM s WHERE id = ?").run(id);
-    this.db.prepare("INSERT INTO s (id, name, content) VALUES (?, ?, ?)").run(id, name, content);
-    this.db.exec("COMMIT");
+    withTransaction(this.db, () => {
+      this.db.prepare("DELETE FROM s WHERE id = ?").run(id);
+      this.db.prepare("INSERT INTO s (id, name, content) VALUES (?, ?, ?)").run(id, name, content);
+    });
   }
   delete(id: string) { this.db.prepare("DELETE FROM s WHERE id = ?").run(id); }
   clear() { this.db.exec("DELETE FROM s"); }
@@ -65,11 +64,11 @@ class FtsSide {
 
   /** Replace the OM rows of a session atomically. */
   upsertOm(sessionId: string, rows: OmMemoryRow[]) {
-    this.db.exec("BEGIN");
-    this.db.prepare("DELETE FROM om_memories WHERE session_id = ?").run(sessionId);
-    const insert = this.db.prepare(OM_INSERT_SQL);
-    for (const row of rows) insert.run(...omRowToParams(row));
-    this.db.exec("COMMIT");
+    withTransaction(this.db, () => {
+      this.db.prepare("DELETE FROM om_memories WHERE session_id = ?").run(sessionId);
+      const insert = this.db.prepare(OM_INSERT_SQL);
+      for (const row of rows) insert.run(...omRowToParams(row));
+    });
   }
   deleteOm(sessionId: string) {
     this.db.prepare("DELETE FROM om_memories WHERE session_id = ?").run(sessionId);

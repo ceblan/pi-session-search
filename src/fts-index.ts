@@ -1,10 +1,10 @@
-import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, statSync } from "node:fs";
+import type { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import type { ParsedSession } from "./parser";
 import { discoverSessionFiles, parseSession, readSessionId } from "./parser";
 import type { SearchResult, ListFilters } from "./session-index";
-import { truncate, buildSummary } from "./utils";
+import { mkdirSync, statSync } from "node:fs";
+import { truncate, buildSummary, openIndexDb, withTransaction } from "./utils";
 import {
   OM_TABLE_DDL,
   OM_INSERT_SQL,
@@ -45,8 +45,7 @@ export class FtsSessionIndex {
   }
 
   async load(): Promise<void> {
-    this.db = new DatabaseSync(this.dbPath);
-    this.db.exec("PRAGMA busy_timeout = 5000;");
+    this.db = openIndexDb(this.dbPath);
 
     // Migrate: add sizeBytes column if missing (FTS5 UNINDEXED columns)
     // FTS5 virtual tables don't support ALTER TABLE ADD COLUMN, so we check
@@ -134,15 +133,15 @@ export class FtsSessionIndex {
     // Remove sessions no longer present
     const delStmt = this.db.prepare("DELETE FROM sessions WHERE id = ?");
     const delOmStmt = this.db.prepare("DELETE FROM om_memories WHERE session_id = ?");
-    this.db.exec("BEGIN");
-    for (const id of currentIds) {
-      if (!idToFile.has(id)) {
-        delStmt.run(id);
-        delOmStmt.run(id);
-        removed++;
+    withTransaction(this.db, () => {
+      for (const id of currentIds) {
+        if (!idToFile.has(id)) {
+          delStmt.run(id);
+          delOmStmt.run(id);
+          removed++;
+        }
       }
-    }
-    this.db.exec("COMMIT");
+    });
 
     // Figure out what needs (re-)ingestion
     const toIngest: { id: string; file: string; archived: boolean; mtimeMs: number; sizeBytes: number }[] = [];
@@ -179,37 +178,37 @@ export class FtsSessionIndex {
     const omDel = this.db.prepare("DELETE FROM om_memories WHERE session_id = ?");
     const omInsert = this.db.prepare(OM_INSERT_SQL);
 
-    this.db.exec("BEGIN");
-    let done = 0;
-    for (const item of toIngest) {
-      const session = parseSession(item.file, item.archived);
-      if (!session || session.userMessageCount === 0) { done++; continue; }
-      const content = buildContent(session);
-      const summary = buildSummary(session);
-      const isUpdate = currentIds.has(item.id);
-      if (isUpdate) replaceDel.run(item.id);
-      insertStmt.run(
-        session.id,
-        session.file,
-        session.archived ? 1 : 0,
-        session.startedAt,
-        session.projectSlug,
-        session.cwd,
-        item.mtimeMs,
-        item.sizeBytes,
-        JSON.stringify(session),
-        summary,
-        session.name ?? "",
-        content,
-      );
-      // OM rows: replace atomically with the session row (same transaction)
-      omDel.run(session.id);
-      for (const row of session.omMemories) omInsert.run(...omRowToParams(row));
-      if (isUpdate) updated++; else added++;
-      done++;
-      if (done % 25 === 0) onProgress?.(`Indexed ${done}/${toIngest.length}...`);
-    }
-    this.db.exec("COMMIT");
+    withTransaction(this.db, () => {
+      let done = 0;
+      for (const item of toIngest) {
+        const session = parseSession(item.file, item.archived);
+        if (!session || session.userMessageCount === 0) { done++; continue; }
+        const content = buildContent(session);
+        const summary = buildSummary(session);
+        const isUpdate = currentIds.has(item.id);
+        if (isUpdate) replaceDel.run(item.id);
+        insertStmt.run(
+          session.id,
+          session.file,
+          session.archived ? 1 : 0,
+          session.startedAt,
+          session.projectSlug,
+          session.cwd,
+          item.mtimeMs,
+          item.sizeBytes,
+          JSON.stringify(session),
+          summary,
+          session.name ?? "",
+          content,
+        );
+        // OM rows: replace atomically with the session row (same transaction)
+        omDel.run(session.id);
+        for (const row of session.omMemories) omInsert.run(...omRowToParams(row));
+        if (isUpdate) updated++; else added++;
+        done++;
+        if (done % 25 === 0) onProgress?.(`Indexed ${done}/${toIngest.length}...`);
+      }
+    });
 
     return { added, updated, removed, moved };
   }
@@ -386,19 +385,19 @@ export class FtsSessionIndex {
     let sessions = 0;
     let rows = 0;
     let done = 0;
-    this.db.exec("BEGIN");
-    for (const c of candidates) {
-      const session = parseSession(c.file, c.archived);
-      if (session && session.userMessageCount > 0) {
-        omDel.run(session.id);
-        for (const row of session.omMemories) omInsert.run(...omRowToParams(row));
-        sessions++;
-        rows += session.omMemories.length;
+    withTransaction(this.db, () => {
+      for (const c of candidates) {
+        const session = parseSession(c.file, c.archived);
+        if (session && session.userMessageCount > 0) {
+          omDel.run(session.id);
+          for (const row of session.omMemories) omInsert.run(...omRowToParams(row));
+          sessions++;
+          rows += session.omMemories.length;
+        }
+        done++;
+        if (done % 50 === 0) onProgress?.(`Reparsed ${done}/${candidates.length} OM files...`);
       }
-      done++;
-      if (done % 50 === 0) onProgress?.(`Reparsed ${done}/${candidates.length} OM files...`);
-    }
-    this.db.exec("COMMIT");
+    });
     return { scanned, candidates: candidates.length, sessions, rows, embedded: 0, skippedEmpty: 0 };
   }
 

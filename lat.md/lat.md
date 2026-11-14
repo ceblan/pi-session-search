@@ -37,6 +37,8 @@ El paquete guarda configuración e índices bajo `~/.pi/session-search/`, tal co
   - Modo híbrido: `session-index.json` (metadatos + embeddings) y `hybrid-fts.db` (side-car FTS)
   - Memorias OM: tabla `om_memories` dentro de esas DBs + vectores en `om-embeddings.db` (fichero propio, fingerprinted por embedder) — ver [[om#Observational Memory]]
 
+Las DBs SQLite usan WAL (`journal_mode=WAL`): junto a cada `.db` pueden aparecer ficheros transitorios `-wal`/`-shm`, y la conversión la aplica [[src/utils.ts#openIndexDb]] en cada apertura.
+
 ## Flujo de trabajo (end-to-end)
 
 En ejecución normal, la extensión arranca un índice (FTS o híbrido), sincroniza sesiones desde disco y expone herramientas al agente para recuperar contexto.
@@ -47,7 +49,7 @@ En ejecución normal, la extensión arranca un índice (FTS o híbrido), sincron
    - Si no hay embedder: usa [[src/fts-index.ts#FtsSessionIndex]].
 3. `load()` del índice (abre DBs y/o carga JSON persistente).
 4. **Sync incremental** inicial en background (`sync()`): descubre archivos con [[src/parser.ts#discoverSessionFiles]], parsea con [[src/parser.ts#parseSession]] y actualiza el índice.
-5. **Sync periódico**: cada 5 minutos se ejecuta `sync()` para incorporar nuevas sesiones/cambios.
+5. **Sync periódico**: cada ~5 minutos (jitter ±25% por proceso, para evitar que sesiones concurrentes sincronicen en manada) se ejecuta `sync()` para incorporar nuevas sesiones/cambios.
 6. Antes de que arranque el agente (`before_agent_start`): se inyecta un *primer* con sesiones recientes (si el índice ya está listo) usando utilidades como [[src/utils.ts#formatRelativeDate]] y [[src/utils.ts#pathToSlug]].
 7. Durante la sesión, el agente usa:
    - `session_search` para búsqueda
@@ -199,6 +201,16 @@ Además, varios módulos son tolerantes a errores:
 - El índice ignora archivos sin `stat()` o sin UUID.
 - El embedder en batch puede devolver `null` por item; el index salta embeddings fallidos.
 
+### Concurrencia multi-proceso en las DBs SQLite
+
+Toda sesión de pi abierta monta esta extensión sobre los mismos ficheros SQLite; con sesiones que viven días en paneles, conviven 10-15 procesos escribiendo el mismo índice. Reglas de apertura y transacción obligatorias:
+
+Incidente 2026-11-14: un escritor atascado en PENDING más lectores con SHARED abandonados formaron un standoff permanente que rompía el init de toda sesión nueva ("database is locked").
+
+- Apertura SIEMPRE con [[src/utils.ts#openIndexDb]]: `busy_timeout=30000` + `journal_mode=WAL`. En rollback-journal un escritor en commit bloquea lectores; en WAL, nunca.
+- Toda transacción `BEGIN…COMMIT` va envuelta en [[src/utils.ts#withTransaction]], que hace `ROLLBACK` antes de re-lanzar el error. Sin rollback, una sentencia fallida abandona la txn abierta y filtra locks SQLite hasta la muerte del proceso.
+- El pragma WAL es persistente en la cabecera de la DB; si la conversión falla por locks de procesos viejos aún en rollback, se reintenta en la siguiente apertura sin romper el init.
+
 ## Referencia por módulo
 
 Esta sección resume la responsabilidad de cada archivo TypeScript en `src/`.
@@ -237,4 +249,4 @@ Implementa [[src/reader.ts#readSessionConversation]] para convertir JSONL en un 
 
 ### `src/utils.ts` (helpers)
 
-Incluye utilidades de presentación y normalización: [[src/utils.ts#truncate]], [[src/utils.ts#slugToProject]], [[src/utils.ts#pathToSlug]], [[src/utils.ts#formatRelativeDate]] y el resumen de sesión [[src/utils.ts#buildSummary]].
+Incluye utilidades de presentación y normalización: [[src/utils.ts#truncate]], [[src/utils.ts#slugToProject]], [[src/utils.ts#pathToSlug]], [[src/utils.ts#formatRelativeDate]] y el resumen de sesión [[src/utils.ts#buildSummary]]. Además, [[src/utils.ts#openIndexDb]] y [[src/utils.ts#withTransaction]] implementan la seguridad de concurrencia SQLite (WAL, busy timeout, rollback garantizado).

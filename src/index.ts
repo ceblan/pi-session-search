@@ -25,6 +25,9 @@ export default function (pi: ExtensionAPI) {
   let syncTimer: ReturnType<typeof setInterval> | null = null;
 
   const SYNC_INTERVAL_MS = 5 * 60 * 1000; // re-sync every 5 minutes
+  // Per-process jitter (±25%): every running pi session opens these DBs;
+  // jitter keeps their periodic syncs from stampeding in lockstep.
+  const syncIntervalMs = Math.round(SYNC_INTERVAL_MS * (0.75 + Math.random() * 0.5));
 
   // ------------------------------------------------------------------
   // Lifecycle
@@ -201,7 +204,7 @@ export default function (pi: ExtensionAPI) {
         } catch {
           // Silent — don't spam on background sync failures
         }
-      }, SYNC_INTERVAL_MS);
+      }, syncIntervalMs);
       syncTimer.unref?.();
     } catch (err: any) {
       safeNotify(`session-search init failed: ${err.message}`, "error");

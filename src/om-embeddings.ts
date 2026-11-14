@@ -11,9 +11,10 @@
  * spaces under the same memory_id.
  */
 
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import type { EmbedderConfig } from "./embedder";
+import { openIndexDb, withTransaction } from "./utils";
 
 export interface EmbedderFingerprint {
   model: string;
@@ -50,8 +51,7 @@ export class OmEmbeddingStore {
   private db: DatabaseSync;
 
   constructor(indexDir: string) {
-    this.db = new DatabaseSync(join(indexDir, "om-embeddings.db"));
-    this.db.exec("PRAGMA busy_timeout = 5000;");
+    this.db = openIndexDb(join(indexDir, "om-embeddings.db"));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS om_embeddings (
         memory_id TEXT PRIMARY KEY,
@@ -136,9 +136,9 @@ export class OmEmbeddingStore {
     const orphans = rows.map((r) => String(r.memory_id)).filter((id) => !keepIds.has(id));
     if (orphans.length === 0) return 0;
     const del = this.db.prepare("DELETE FROM om_embeddings WHERE memory_id = ?");
-    this.db.exec("BEGIN");
-    for (const id of orphans) del.run(id);
-    this.db.exec("COMMIT");
+    withTransaction(this.db, () => {
+      for (const id of orphans) del.run(id);
+    });
     return orphans.length;
   }
 

@@ -2,6 +2,52 @@
  * Shared utility functions used across the session search package.
  */
 
+import { DatabaseSync } from "node:sqlite";
+
+/**
+ * Open an index database shared by every running pi process.
+ *
+ * WAL lets readers proceed while a writer commits (and vice versa), so one
+ * process's open transaction can never wedge another process's startup;
+ * the generous busy timeout absorbs multi-writer contention.
+ */
+// @lat: [[lat#Consideraciones de seguridad y robustez#Concurrencia multi-proceso en las DBs SQLite]]
+export function openIndexDb(path: string): DatabaseSync {
+  const db = new DatabaseSync(path);
+  db.exec("PRAGMA busy_timeout = 30000;");
+  try {
+    db.exec("PRAGMA journal_mode = WAL;");
+  } catch {
+    // Conversion needs a moment with no other locks; if the DB is busy
+    // (e.g. a legacy rollback-mode standoff), keep going — it retries on
+    // the next process to open the DB. WAL is persistent once it lands.
+  }
+  return db;
+}
+
+/**
+ * Run `fn` inside a transaction, rolling back on error. Without the
+ * rollback, a failed statement abandons an open transaction that leaks
+ * SQLite locks until the process exits (a wedged writer under
+ * multi-process contention blocks every other connection).
+ */
+// @lat: [[lat#Consideraciones de seguridad y robustez#Concurrencia multi-proceso en las DBs SQLite]]
+export function withTransaction<T>(db: DatabaseSync, fn: () => T): T {
+  db.exec("BEGIN");
+  try {
+    const result = fn();
+    db.exec("COMMIT");
+    return result;
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // transaction already closed
+    }
+    throw err;
+  }
+}
+
 /** Truncate a string to `max` characters, appending "…" if truncated. */
 export function truncate(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max) + "…";
