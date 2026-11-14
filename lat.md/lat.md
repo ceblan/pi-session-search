@@ -26,6 +26,7 @@ Sección transversal que agrupa documentación de las herramientas internas del 
 
 - [[om]] — integración Observational Memory (extracción, esquema, tools, backfill)
 - [[last-commit]] — tracking del último commit revisado por el documentator
+- [[sqlite-tests]] — regresiones de apertura, concurrencia y rollback
 
 ## Directorios y artefactos persistentes
 
@@ -207,9 +208,14 @@ Toda sesión de pi abierta monta esta extensión sobre los mismos ficheros SQLit
 
 Incidente 2026-11-14: un escritor atascado en PENDING más lectores con SHARED abandonados formaron un standoff permanente que rompía el init de toda sesión nueva ("database is locked").
 
-- Apertura SIEMPRE con [[src/utils.ts#openIndexDb]]: `busy_timeout=30000` + `journal_mode=WAL`. En rollback-journal un escritor en commit bloquea lectores; en WAL, nunca.
-- Toda transacción `BEGIN…COMMIT` va envuelta en [[src/utils.ts#withTransaction]], que hace `ROLLBACK` antes de re-lanzar el error. Sin rollback, una sentencia fallida abandona la txn abierta y filtra locks SQLite hasta la muerte del proceso.
-- El pragma WAL es persistente en la cabecera de la DB; si la conversión falla por locks de procesos viejos aún en rollback, se reintenta en la siguiente apertura sin romper el init.
+- Apertura SIEMPRE con [[src/utils.ts#openIndexDb]]: `busy_timeout=30000` + `journal_mode=WAL`. WAL permite lectores durante un commit ordinario, pero sigue habiendo un único escritor; no elimina todos los posibles errores `SQLITE_BUSY`.
+- Las seis transacciones de escritura usan [[src/utils.ts#withTransaction]] con `BEGIN IMMEDIATE`: reserva el escritor antes de las lecturas internas de FTS5. Con `BEGIN` diferido, la promoción de lectura a escritura puede fallar sin esperar el timeout.
+- El cuerpo es síncrono. Si falla el cuerpo o `COMMIT`, se intenta `ROLLBACK` y se propaga el error original. Si falla la reserva inicial, el cuerpo no se ejecuta.
+- WAL es persistente. Si falla la configuración de la conexión (incluida la conversión desde rollback), se cierra y se propaga el error: no se continúa silenciosamente sin WAL. Los locks heredados aún pueden impedir el inicio hasta que se liberen.
+
+Las regresiones en [[sqlite-tests#Pruebas de SQLite]] cubren archivos temporales, dos conexiones y un escritor en un worker independiente; no usan las DBs del usuario.
+
+Una recarga activa el código nuevo, pero no libera conexiones de otros procesos. Si los locks heredados impiden migrar a WAL, hay que cerrar sus procesos antes de reintentar; no renombrar ni sustituir una DB SQLite mientras siga en uso.
 
 ## Referencia por módulo
 
@@ -249,4 +255,4 @@ Implementa [[src/reader.ts#readSessionConversation]] para convertir JSONL en un 
 
 ### `src/utils.ts` (helpers)
 
-Incluye utilidades de presentación y normalización: [[src/utils.ts#truncate]], [[src/utils.ts#slugToProject]], [[src/utils.ts#pathToSlug]], [[src/utils.ts#formatRelativeDate]] y el resumen de sesión [[src/utils.ts#buildSummary]]. Además, [[src/utils.ts#openIndexDb]] y [[src/utils.ts#withTransaction]] implementan la seguridad de concurrencia SQLite (WAL, busy timeout, rollback garantizado).
+Incluye utilidades de presentación y normalización: [[src/utils.ts#truncate]], [[src/utils.ts#slugToProject]], [[src/utils.ts#pathToSlug]], [[src/utils.ts#formatRelativeDate]] y el resumen de sesión [[src/utils.ts#buildSummary]]. Además, [[src/utils.ts#openIndexDb]] y [[src/utils.ts#withTransaction]] centralizan el acceso SQLite (WAL, espera entre escritores y rollback ante errores).

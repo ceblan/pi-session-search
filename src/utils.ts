@@ -4,36 +4,25 @@
 
 import { DatabaseSync } from "node:sqlite";
 
-/**
- * Open an index database shared by every running pi process.
- *
- * WAL lets readers proceed while a writer commits (and vice versa), so one
- * process's open transaction can never wedge another process's startup;
- * the generous busy timeout absorbs multi-writer contention.
- */
+/** Open a shared index in WAL mode; close the connection if setup fails. */
 // @lat: [[lat#Consideraciones de seguridad y robustez#Concurrencia multi-proceso en las DBs SQLite]]
 export function openIndexDb(path: string): DatabaseSync {
   const db = new DatabaseSync(path);
-  db.exec("PRAGMA busy_timeout = 30000;");
   try {
+    db.exec("PRAGMA busy_timeout = 30000;");
     db.exec("PRAGMA journal_mode = WAL;");
-  } catch {
-    // Conversion needs a moment with no other locks; if the DB is busy
-    // (e.g. a legacy rollback-mode standoff), keep going — it retries on
-    // the next process to open the DB. WAL is persistent once it lands.
+    return db;
+  } catch (err) {
+    db.close();
+    throw err;
   }
-  return db;
 }
 
-/**
- * Run `fn` inside a transaction, rolling back on error. Without the
- * rollback, a failed statement abandons an open transaction that leaks
- * SQLite locks until the process exits (a wedged writer under
- * multi-process contention blocks every other connection).
- */
+/** Run a synchronous write transaction; roll back if the body or commit fails. */
 // @lat: [[lat#Consideraciones de seguridad y robustez#Concurrencia multi-proceso en las DBs SQLite]]
 export function withTransaction<T>(db: DatabaseSync, fn: () => T): T {
-  db.exec("BEGIN");
+  // Reserve the writer before FTS5 reads: read-to-write upgrades can skip busy_timeout.
+  db.exec("BEGIN IMMEDIATE");
   try {
     const result = fn();
     db.exec("COMMIT");
@@ -42,7 +31,7 @@ export function withTransaction<T>(db: DatabaseSync, fn: () => T): T {
     try {
       db.exec("ROLLBACK");
     } catch {
-      // transaction already closed
+      // SQLite may already have rolled back the transaction.
     }
     throw err;
   }
